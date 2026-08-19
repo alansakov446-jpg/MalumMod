@@ -21,6 +21,7 @@ import httpx
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import Message
 
@@ -56,8 +57,10 @@ SYSTEM_PROMPT = f"""Ты — «Ириска», дружелюбный помощ
 - Если в базе знаний ниже нет точного ответа — не выдумывай синтаксис.
   Скажи, что не уверена в точной команде, и посоветуй написать в чате
   "Команды" или заглянуть в официальный список: teletype.in/@iris_cm/commands
-- Не используй тяжёлое форматирование — Telegram поддерживает *жирный*,
-  _курсив_ и `код`.
+- Форматирование используй по минимуму и аккуратно: Telegram понимает
+  *жирный*, _курсив_ и `код`, но каждый символ *, _ и ` обязательно должен
+  быть закрыт парой. Если не уверена, что разметка получится корректной —
+  лучше вообще без неё, простым текстом.
 
 База знаний по командам Iris:
 ---
@@ -154,7 +157,25 @@ async def main() -> None:
         except Exception:
             log.exception("Failed to get answer from Gemini")
             answer = "Что-то пошло не так при обращении к ИИ. Попробуй ещё раз."
-        await message.reply(answer)
+
+        # Ответ Ириски может содержать "битую" markdown-разметку (например,
+        # непарные * или _), из-за которой Telegram откажется отправлять
+        # сообщение. Раньше это приводило к полному молчанию бота — теперь
+        # при такой ошибке пробуем отправить тот же текст без разметки.
+        try:
+            await message.reply(answer)
+        except TelegramBadRequest:
+            log.warning("Markdown parse failed, retrying as plain text")
+            try:
+                await message.reply(answer, parse_mode=None)
+            except Exception:
+                log.exception("Failed to send reply even as plain text")
+                await message.reply(
+                    "Не смогла корректно отправить ответ (ошибка форматирования). "
+                    "Попробуй переформулировать вопрос."
+                )
+        except Exception:
+            log.exception("Failed to send reply")
 
     log.info("Ириска запущена, модель: %s", GEMINI_MODEL)
 
