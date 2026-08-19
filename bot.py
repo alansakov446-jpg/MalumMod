@@ -5,7 +5,7 @@
 Нужные переменные окружения:
     BOT_TOKEN       — токен телеграм-бота (от @BotFather)
     GROQ_API_KEY    — бесплатный ключ Groq (console.groq.com/keys)
-    GROQ_MODEL      — необязательно, по умолчанию groq/compound-mini
+    GROQ_MODEL      — необязательно, по умолчанию openai/gpt-oss-120b
     MAX_RUNTIME_SEC — необязательно, через сколько секунд бот сам
                       завершится (нужно для GitHub Actions, см. bot.yml)
 """
@@ -30,14 +30,15 @@ log = logging.getLogger("iriska")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "groq/compound-mini")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 MAX_RUNTIME_SEC = int(os.environ.get("MAX_RUNTIME_SEC", "0"))  # 0 = без лимита
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-KNOWLEDGE_BASE = Path(__file__).with_name("knowledge_base.md").read_text(encoding="utf-8")
+KNOWLEDGE_BASE_PATH = Path(__file__).with_name("knowledge_base.md")
+KNOWLEDGE_BASE_RAW = KNOWLEDGE_BASE_PATH.read_text(encoding="utf-8")
 
-SYSTEM_PROMPT = f"""Ты — «Ириска», дружелюбный помощник в Telegram-чатах, который
+BASE_SYSTEM_PROMPT = """Ты — «Ириска», дружелюбный помощник в Telegram-чатах, который
 объясняет пользователям, как пользоваться ботом-модератором Iris | Чат-менеджер
 (@iris_cm_bot). Ты не сам Iris и не выполняешь его команды — ты только
 подсказываешь, какую именно команду и в каком формате нужно написать.
@@ -51,19 +52,96 @@ SYSTEM_PROMPT = f"""Ты — «Ириска», дружелюбный помощ
   коротко или покажи общий шаблон команды с плейсхолдерами.
 - Если вопрос не связан с Iris (общие вопросы, не про бота) — вежливо
   скажи, что помогаешь только по функциям Iris | Чат-менеджер.
-- Если в базе знаний ниже нет точного ответа — не выдумывай синтаксис.
+- Ниже приведены только НАИБОЛЕЕ РЕЛЕВАНТНЫЕ разделы базы знаний по этому
+  конкретному вопросу (полная база гораздо больше и не помещается в один
+  запрос). Если среди них нет точного ответа — НЕ выдумывай синтаксис.
   Скажи, что не уверена в точной команде, и посоветуй написать в чате
   "Команды" или заглянуть в официальный список: teletype.in/@iris_cm/commands
 - Форматирование используй по минимуму и аккуратно: Telegram понимает
   *жирный*, _курсив_ и `код`, но каждый символ *, _ и ` обязательно должен
   быть закрыт парой. Если не уверена, что разметка получится корректной —
   лучше вообще без неё, простым текстом.
-
-База знаний по командам Iris:
----
-{KNOWLEDGE_BASE}
----
 """
+
+# --- Разбиение базы знаний на разделы для RAG-подобного поиска -------------
+# Вся knowledge_base.md слишком большая, чтобы отправлять её целиком в
+# каждом запросе (упирается в лимиты Groq по размеру запроса/токенов в
+# минуту). Поэтому под каждый вопрос выбираем несколько наиболее подходящих
+# разделов (по совпадению ключевых слов) и отправляем только их + общие
+# правила синтаксиса, которые нужны всегда.
+
+_STOPWORDS = {
+    "как", "что", "это", "для", "или", "она", "они", "нее", "него", "мне",
+    "мой", "моя", "мои", "его", "мне", "нам", "вас", "тебя", "если", "чтобы",
+    "можно", "нужно", "пожалуйста", "привет", "ириска", "ирис", "бот",
+    "команда", "команду", "команды", "напиши", "подскажи", "помоги",
+    "написать", "который", "которая", "которое",
+}
+
+
+def _normalize_words(text: str) -> set[str]:
+    words = re.findall(r"[а-яёa-z0-9]+", text.lower())
+    result = set()
+    for w in words:
+        if len(w) <= 2 or w in _STOPWORDS:
+            continue
+        # Грубое «усечение окончаний»: сравниваем первые 4 буквы слова,
+        # чтобы разные словоформы (мут/мута/мутить, биржа/бирже, дуэль/дуэли)
+        # всё равно совпадали при простом поиске по пересечению множеств.
+        result.add(w[:4] if len(w) > 4 else w)
+    return result
+
+
+def _split_into_sections(markdown_text: str) -> list[tuple[str, str]]:
+    """Делит markdown на секции по заголовкам ## (сохраняя интро до первого ##)."""
+    parts = re.split(r"(?m)^(## .+)$", markdown_text)
+    sections: list[tuple[str, str]] = []
+    if parts and parts[0].strip():
+        sections.append(("Общие правила синтаксиса", parts[0].strip()))
+    for i in range(1, len(parts), 2):
+        title = parts[i].lstrip("# ").strip()
+        body = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        sections.append((title, f"{parts[i]}\n{body}".strip()))
+    return sections
+
+
+KB_SECTIONS = _split_into_sections(KNOWLEDGE_BASE_RAW)
+# Первая секция ("Общие правила синтаксиса") нужна почти всегда — держим её
+# отдельно и добавляем в каждый запрос вне конкурса по релевантности.
+_INTRO_SECTION = KB_SECTIONS[0][1] if KB_SECTIONS else ""
+_SEARCHABLE_SECTIONS = KB_SECTIONS[1:] if len(KB_SECTIONS) > 1 else KB_SECTIONS
+_SECTION_WORDS = [(title, body, _normalize_words(title + " " + body)) for title, body in _SEARCHABLE_SECTIONS]
+
+MAX_KB_CHARS = 6000  # ограничиваем объём базы, отправляемой в одном запросе
+TOP_SECTIONS = 4
+
+
+def build_knowledge_excerpt(question: str) -> str:
+    """Возвращает интро + до TOP_SECTIONS наиболее релевантных вопросу разделов,
+    суммарно не длиннее MAX_KB_CHARS символов."""
+    q_words = _normalize_words(question)
+    scored = []
+    if q_words:
+        for title, body, words in _SECTION_WORDS:
+            overlap = len(q_words & words)
+            if overlap:
+                scored.append((overlap, title, body))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    chosen: list[str] = []
+    budget = MAX_KB_CHARS - len(_INTRO_SECTION)
+    for _, _title, body in scored[:TOP_SECTIONS]:
+        if budget <= 0:
+            break
+        chosen.append(body[:budget])
+        budget -= len(body)
+
+    if not chosen:
+        # Ничего конкретного не нашли — даём небольшую подсказку модели,
+        # чтобы она не выдумывала синтаксис, а предложила официальный список.
+        return _INTRO_SECTION
+
+    return _INTRO_SECTION + "\n\n" + "\n\n".join(chosen)
 
 # История диалога по chat_id, чтобы Ириска помнила контекст переписки
 # (простое хранение в памяти процесса; сбрасывается при перезапуске бота)
@@ -81,7 +159,17 @@ async def ask_ai(chat_id: int, question: str) -> str:
     history.append({"role": "user", "content": question})
     history[:] = history[-MAX_HISTORY_MESSAGES:]
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+    # Под каждый вопрос собираем компактную выжимку базы знаний (см.
+    # build_knowledge_excerpt) вместо того, чтобы слать её целиком — так
+    # запрос остаётся маленьким независимо от того, насколько выросла
+    # knowledge_base.md.
+    excerpt = build_knowledge_excerpt(question)
+    system_prompt = (
+        f"{BASE_SYSTEM_PROMPT}\nРелевантные разделы базы знаний по командам "
+        f"Iris:\n---\n{excerpt}\n---\n"
+    )
+
+    messages = [{"role": "system", "content": system_prompt}, *history]
     payload = {
         "model": GROQ_MODEL,
         "messages": messages,
