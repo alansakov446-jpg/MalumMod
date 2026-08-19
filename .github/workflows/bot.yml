@@ -1,0 +1,40 @@
+name: Ириска бот
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Запускается каждые 6 часов. Сам процесс работает ~5 ч 50 мин и
+    # завершается сам (см. MAX_RUNTIME_SEC), чтобы новый запуск подхватил
+    # эстафету раньше жёсткого лимита GitHub Actions в 6 часов на джобу.
+    - cron: "0 */6 * * *"
+
+# Не даём двум копиям бота работать одновременно с одним и тем же токеном
+# (Telegram отдаёт ошибку 409, если два процесса одновременно опрашивают
+# getUpdates). Новый запуск подождёт, пока предыдущий завершится.
+concurrency:
+  group: iriska-bot
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355  # чуть меньше жёсткого лимита GitHub в 360 минут
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Ириска
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MAX_RUNTIME_SEC: "21000"  # 5 ч 50 мин
+        run: python bot.py
