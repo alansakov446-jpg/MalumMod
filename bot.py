@@ -207,7 +207,7 @@ async def ask_ai(chat_id: int, question: str) -> str:
                 history.pop()
                 return "Хм, не получилось разобрать ответ ИИ. Попробуй переформулировать вопрос."
             
-            # Очищаем ответ от тегов  и их содержимого
+            # Очищаем ответ от тегов <think> и их содержимого
             clean_answer = re.sub(r'<think>.*?</think>', '', raw_answer, flags=re.DOTALL).strip()
             
             history.append({"role": "assistant", "content": clean_answer})
