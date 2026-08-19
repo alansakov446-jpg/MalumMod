@@ -26,47 +26,32 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("iriska")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+# Получаем строку ключей, разбиваем по запятой и убираем лишние пробелы
 GROQ_API_KEY_STR = os.environ["GROQ_API_KEY"]
 GROQ_API_KEYS = [key.strip() for key in GROQ_API_KEY_STR.split(',')]
 CURRENT_KEY_INDEX = 0
 
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.6-27b")
-MAX_RUNTIME_SEC = int(os.environ.get("MAX_RUNTIME_SEC", "0"))
+MAX_RUNTIME_SEC = int(os.environ.get("MAX_RUNTIME_SEC", "0"))  # 0 = без лимита
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 KNOWLEDGE_BASE_PATH = Path(__file__).with_name("knowledge_base.md")
 KNOWLEDGE_BASE_RAW = KNOWLEDGE_BASE_PATH.read_text(encoding="utf-8")
 
-# ЖЁСТКАЯ инструкция модели НЕ писать внутренние размышления
-BASE_SYSTEM_PROMPT = """Ты — «Ириска», дружелюбный помощник в Telegram-чатах, который
-объясняет пользователям, как пользоваться ботом-модератором Iris | Чат-менеджер
-(@iris_cm_bot). Ты не сам Iris и не выполняешь его команды — ты только
-подсказываешь, какую именно команду и в каком формате нужно написать.
-
-КРИТИЧЕСКИ ВАЖНО — ПРАВИЛА ФОРМАТА ОТВЕТА:
-1. НИКОГДА не используй теги , , , , ,  и любые другие теги размышлений.
-2. НИКОГДА не пиши заголовки вроде "Thinking Process:", "Анализ запроса:",
-   "Размышления:", "**Анализ:**", "Internal Monologue" и т.п.
-3. НИКОГДА не показывай пользователю свои внутренние рассуждения, шаги анализа,
-   черновики ответа или numbered lists вида "1. Analyze... 2. Consult... 3. Draft...".
-4. Отвечай СРАЗУ готовым финальным текстом — без преамбул, без "давайте разберёмся",
-   без перечисления шагов твоих рассуждений.
-5. Если ты сомневаешься в ответе — просто скажи "не уверена, проверь командой Команды",
-   а НЕ пиши длинное рассуждение почему.
-
-Правила ответа по содержанию:
-Отвечай по-русски, кратко и по делу (обычно 2-6 предложений или список).
-Всегда давай готовую команду Iris в блоке кода или явно выделенной строкой,
-с подставленными по контексту значениями, если это уместно.
-Если в вопросе не хватает данных — спроси коротко или покажи общий шаблон.
-Если вопрос не связан с Iris — вежливо скажи, что помогаешь только по Iris.
-Если среди приведённых ниже разделов базы знаний нет точного ответа — НЕ
-выдумывай синтаксис. Посоветуй написать в чате "Команды" или заглянуть в
-официальный список: teletype.in/@iris_cm/commands
-Форматирование используй по минимуму: Telegram понимает жирный, курсив и
-`код`, но каждый символ *, _ и ` должен быть закрыт парой. Если не уверена —
-лучше без разметки, простым текстом.
+# Короткий и ёмкий системный промпт — без капса и запретов.
+# Модель сама поймёт, что от неё хотят, если не перегружать её инструкциями.
+BASE_SYSTEM_PROMPT = """Ты — «Ириска», помощник по командам бота Iris | Чат-менеджер (@iris_cm_bot).
+Отвечай кратко (2-5 предложений), по-русски, без лишних вступлений.
+Всегда давай точную команду Iris в блоке кода.
+Если вопрос не про Iris — ответь, что помогаешь только по Iris.
 """
+
+# --- Разбиение базы знаний на разделы для RAG-подобного поиска -------------
+# Вся knowledge_base.md слишком большая, чтобы отправлять её целиком в
+# каждом запросе (упирается в лимиты Groq по размеру запроса/токенов в
+# минуту). Поэтому под каждый вопрос выбираем несколько наиболее подходящих
+# разделов (по совпадению ключевых слов) и отправляем только их + общие
+# правила синтаксиса, которые нужны всегда.
 
 _STOPWORDS = {
     "как ", "что ", "это ", "для ", "или ", "она ", "они ", "нее ", "него ", "мне ",
@@ -82,10 +67,14 @@ def _normalize_words(text: str) -> set[str]:
     for w in words:
         if len(w) <= 2 or w in _STOPWORDS:
             continue
+        # Грубое «усечение окончаний»: сравниваем первые 4 буквы слова,
+        # чтобы разные словоформы (мут/мута/мутить, биржа/бирже, дуэль/дуэли)
+        # всё равно совпадали при простом поиске по пересечению множеств.
         result.add(w[:4] if len(w) > 4 else w)
     return result
 
 def _split_into_sections(markdown_text: str) -> list[tuple[str, str]]:
+    """Делит markdown на секции по заголовкам ## (сохраняя интро до первого ##)."""
     parts = re.split(r"(?m)^(## .+)$", markdown_text)
     sections: list[tuple[str, str]] = []
     if parts and parts[0].strip():
@@ -97,14 +86,18 @@ def _split_into_sections(markdown_text: str) -> list[tuple[str, str]]:
     return sections
 
 KB_SECTIONS = _split_into_sections(KNOWLEDGE_BASE_RAW)
+# Первая секция ("Общие правила синтаксиса") нужна почти всегда — держим её
+# отдельно и добавляем в каждый запрос вне конкурса по релевантности.
 _INTRO_SECTION = KB_SECTIONS[0][1] if KB_SECTIONS else ""
 _SEARCHABLE_SECTIONS = KB_SECTIONS[1:] if len(KB_SECTIONS) > 1 else KB_SECTIONS
 _SECTION_WORDS = [(title, body, _normalize_words(title + " " + body)) for title, body in _SEARCHABLE_SECTIONS]
 
-MAX_KB_CHARS = 6000
+MAX_KB_CHARS = 6000  # ограничиваем объём базы, отправляемой в одном запросе
 TOP_SECTIONS = 4
 
 def build_knowledge_excerpt(question: str) -> str:
+    """Возвращает интро + до TOP_SECTIONS наиболее релевантных вопросу разделов,
+    суммарно не длиннее MAX_KB_CHARS символов."""
     q_words = _normalize_words(question)
     scored = []
     if q_words:
@@ -112,6 +105,7 @@ def build_knowledge_excerpt(question: str) -> str:
             overlap = len(q_words & words)
             if overlap:
                 scored.append((overlap, title, body))
+    # Сортируем по убыванию relevance
     scored.sort(key=lambda x: x[0], reverse=True)
 
     chosen: list[str] = []
@@ -123,6 +117,8 @@ def build_knowledge_excerpt(question: str) -> str:
         budget -= len(body)
 
     if not chosen:
+        # Ничего конкретного не нашли — даём небольшую подсказку модели,
+        # чтобы она не выдумывала синтаксис, а предложила официальный список.
         return _INTRO_SECTION
     return _INTRO_SECTION + "\n\n" + "\n\n".join(chosen)
 
@@ -130,71 +126,29 @@ def build_knowledge_excerpt(question: str) -> str:
 def rotate_key():
     global CURRENT_KEY_INDEX
     CURRENT_KEY_INDEX = (CURRENT_KEY_INDEX + 1) % len(GROQ_API_KEYS)
-    log.info(f"Смена API-ключа. Индекс {CURRENT_KEY_INDEX}, ключ: {GROQ_API_KEYS[CURRENT_KEY_INDEX][:10]}...")
+    log.info(f"Смена API-ключа. Теперь используется индекс {CURRENT_KEY_INDEX}, ключ: {GROQ_API_KEYS[CURRENT_KEY_INDEX][:10]}...")
 
-
-# --- АГРЕССИВНАЯ очистка "мыслей" нейросети -------------------------------
-# Qwen3 и похожие модели могут генерировать внутренние размышления в виде:
-#   1) Тегов: , , , , , 
-#   2) Текстовых заголовков: "Thinking Process:", "Анализ запроса:" и т.п.
-#   3) Нумерованных пунктов рассуждений: "1. Analyze... 2. Consult... 3. Draft..."
-#   4) Незакрытых тегов (если модель оборвала генерацию по max_tokens)
-# Функция удаляет ВСЕ эти варианты, оставляя только финальный ответ.
-
-_THINK_TAG_RE = re.compile(
-    r'',
-    re.DOTALL | re.IGNORECASE
-)
-_UNCLOSED_THINK_RE = re.compile(
-    r'.*',
-    re.DOTALL | re.IGNORECASE
-)
-_THINKING_HEADER_RE = re.compile(
-    r'^(?:'
-    r'\*{0,2}\s*(?:thinking process|internal monologue|analysis|размышления|анализ(?:\s+запроса)?|ход\s+мыслей|рассуждение|chain\s+of\s+thought)\s*\*{0,2}\s*[:\-]'
-    r')',
-    re.IGNORECASE | re.MULTILINE
-)
-# Нумерованные пункты рассуждений в начале ответа: "1. **Analyze**..." / "1) Анализ..."
-_NUMBERED_REASONING_RE = re.compile(
-    r'(?:^|\n)\s*\d+[\.\)]\s*\*{0,2}(?:'
-    r'analy|consult|draft|refine|final|consider|evaluate|check|note|step|подход|шаг|анализ|рассужд|вывод|план|провер'
-    r')\w*\*{0,2}[^\n]*',
-    re.IGNORECASE
-)
 
 def clean_think_tags(text: str) -> str:
-    """Удаляет из ответа нейросети все следы внутренних размышлений."""
+    """Простая и надёжная очистка ответа от «мыслей» нейросети.
+    Удаляет:
+      1) Закрытые блоки <think>...</think>
+      2) Незакрытые теги <think> (если модель оборвала генерацию)
+      3) Случайные текстовые маркеры в начале ответа
+    """
     if not text:
         return text
-
-    # 1. Удаляем полностью закрытые теги размышлений (любой вариант)
-    text = _THINK_TAG_RE.sub('', text)
-    # 2. Удаляем незакрытые теги (модель оборвала генерацию)
-    text = _UNCLOSED_THINK_RE.sub('', text)
-    # 3. Ещё раз на случай вложенных/дублирующихся тегов
-    text = _THINK_TAG_RE.sub('', text)
-
-    # 4. Удаляем заголовки типа "Thinking Process:" / "Анализ запроса:"
-    text = _THINKING_HEADER_RE.sub('', text)
-
-    # 5. Удаляем нумерованные пункты рассуждений в начале ответа
-    # (только если они идут подряд в начале — чтобы не задеть нормальные списки)
-    text = text.lstrip()
-    while True:
-        new_text = _NUMBERED_REASONING_RE.sub('', text, count=1).lstrip()
-        if new_text == text:
-            break
-        text = new_text
-
-    # 6. Удаляем возможные оставшиеся маркеры типа "**Draft:**", "**Final answer:**"
-    text = re.sub(r'^\*{0,2}(?:draft|final\s*(?:answer|polish|response)|revised\s*draft|итоговый\s*ответ|черновик)\*{0,2}\s*[:\-]\s*', '', text, flags=re.IGNORECASE | re.MULTILINE)
-
-    # 7. Схлопываем множественные пустые строки
-    text = re.sub(r'\n{3,}', '\n\n', text)
+    # Удаляем закрытый блок <think>...</think>
+    text = re.sub(r'', '', text, flags=re.DOTALL | re.IGNORECASE)
+    # Если тег <think> открылся, но не закрылся — вырезаем всё от <think> до конца
+    text = re.sub(r'.*$', '', text, flags=re.DOTALL | re.IGNORECASE)
+    # Удаляем случайные текстовые маркеры в начале
+    text = re.sub(r'^\s*(?:Thinking Process|Analysis|Размышления|Анализ запроса):?\s*', '', text, flags=re.IGNORECASE)
     return text.strip()
 
 
+# История диалога по chat_id, чтобы Ириска помнила контекст переписки
+# (простое хранение в памяти процесса; сбрасывается при перезапуске бота)
 HISTORY: dict[int, list[dict]] = {}
 MAX_HISTORY_MESSAGES = 6
 
@@ -205,6 +159,10 @@ async def ask_ai(chat_id: int, question: str) -> str:
     history.append({"role": "user", "content": question})
     history[:] = history[-MAX_HISTORY_MESSAGES:]
 
+    # Под каждый вопрос собираем компактную выжимку базы знаний (см.
+    # build_knowledge_excerpt) вместо того, чтобы слать её целиком — так
+    # запрос остаётся маленьким независимо от того, насколько выросла
+    # knowledge_base.md.
     excerpt = build_knowledge_excerpt(question)
     system_prompt = (
         f"{BASE_SYSTEM_PROMPT}\nРелевантные разделы базы знаний по командам "
@@ -215,10 +173,12 @@ async def ask_ai(chat_id: int, question: str) -> str:
     payload = {
         "model": GROQ_MODEL,
         "messages": messages,
-        "temperature": 0.3,  # немного снизили — меньше "размышлений"
+        "temperature": 0.1,  # минимальная температура — строго по фактам
         "max_tokens": 700,
+        "reasoning_format": "raw",  # для Groq API: сырой формат рассуждений
     }
 
+    # Глубина поиска по ключам
     initial_key_index = CURRENT_KEY_INDEX
     attempts = 0
     max_attempts = len(GROQ_API_KEYS)
@@ -231,16 +191,16 @@ async def ask_ai(chat_id: int, question: str) -> str:
             async with httpx.AsyncClient(timeout=30) as client:
                 resp = await client.post(GROQ_URL, headers=headers, json=payload)
         except httpx.TimeoutException:
-            log.error(f"Таймаут Groq, ключ {current_api_key[:10]}...")
-            history.pop()
+            log.error(f"Таймаут при подключении к Groq с ключом {current_api_key[:10]}...")
+            history.pop()  # не сохраняем вопрос, на который не получили ответ
             return "Сетевая ошибка или таймаут при подключении к ИИ. Попробуйте ещё раз через пару секунд."
         except httpx.RequestError as e:
-            log.error(f"Сетевая ошибка Groq: {e}")
-            history.pop()
+            log.error(f"Сетевая ошибка при запросе к Groq: {e}")
+            history.pop()  # не сохраняем вопрос, на который не получили ответ
             return "Сетевая ошибка или таймаут при подключении к ИИ. Попробуйте ещё раз через пару секунд."
         except Exception as e:
-            log.error(f"Неожиданная ошибка Groq: {e}")
-            history.pop()
+            log.error(f"Неожиданная ошибка при запросе к Groq: {e}")
+            history.pop()  # не сохраняем вопрос, на который не получили ответ
             return "Сетевая ошибка при подключении к ИИ. Попробуйте ещё раз через пару секунд."
 
         if resp.status_code == 200:
@@ -252,14 +212,16 @@ async def ask_ai(chat_id: int, question: str) -> str:
                 history.pop()
                 return "Хм, не получилось разобрать ответ ИИ. Попробуй переформулировать вопрос."
 
-            # Логируем сырой ответ, чтобы видеть, что реально присылает модель
+            # Логируем сырой ответ для отладки
             log.debug("Raw AI answer: %s", raw_answer[:500])
 
-            # Агрессивная очистка от "мыслей"
+            # Простая очистка от "мыслей"
             clean_answer = clean_think_tags(raw_answer)
 
+            # Если после очистки ничего не осталось — значит, модель
+            # только думала и не выдала полезного ответа
             if not clean_answer:
-                log.warning("После очистки ответ пустой. Сырой: %s", raw_answer[:500])
+                log.warning("Ответ после очистки  оказался пустым. Сырой ответ: %s", raw_answer[:300])
                 history.pop()
                 return "ИИ не смог сформулировать ответ. Попробуй переформулировать вопрос."
 
@@ -267,30 +229,33 @@ async def ask_ai(chat_id: int, question: str) -> str:
             history[:] = history[-MAX_HISTORY_MESSAGES:]
             return clean_answer
 
+        # Обработка ошибок API
         status_code = resp.status_code
         if status_code in (429, 401, 403):
-            log.warning(f"Groq error {status_code}, ключ {current_api_key[:10]}..., переключаюсь.")
+            log.warning(f"Groq error {status_code} с ключом {current_api_key[:10]}..., переключаюсь на следующий.")
             rotate_key()
             attempts += 1
+            # Проверяем, вернулись ли мы к начальному ключу
             if CURRENT_KEY_INDEX == initial_key_index:
                 log.error("Все API-ключи исчерпаны или недействительны.")
-                history.pop()
+                history.pop()  # не сохраняем вопрос
                 if status_code == 429:
                     return "Все доступные API-ключи исчерпали лимит токенов (Rate Limit). Подождите 2-3 минуты."
                 elif status_code in (401, 403):
                     return "Ошибка авторизации: указанные API-ключи Groq недействительны или заблокированы."
-            continue
+            continue  # Пробуем следующий ключ
         elif status_code in (500, 502, 503, 504):
             log.error(f"Groq server error {status_code}: {resp.text[:500]}")
-            history.pop()
+            history.pop()  # не сохраняем вопрос
             return "Сервер ИИ (Groq) временно недоступен или перегружен. Попробуйте позже."
         else:
             log.error(f"Groq error {status_code}: {resp.text[:500]}")
-            history.pop()
+            history.pop()  # не сохраняем вопрос
             return f"Ошибка API Groq [{status_code}]: {resp.text[:100]}"
 
-    log.error("Все попытки запроса к API не удались.")
-    history.pop()
+    # Если мы вышли из цикла, значит, все ключи были недоступны
+    log.error("Все попытки запроса к API с различными ключами не увенчались успехом.")
+    history.pop()  # не сохраняем вопрос
     return "Все доступные API-ключи исчерпали лимит токенов (Rate Limit). Подождите 2-3 минуты."
 
 
@@ -319,8 +284,12 @@ async def main() -> None:
         is_private = message.chat.type == "private"
         match = TRIGGER_RE.match(message.text)
         if is_private:
+            # В личных сообщениях обращение "ириска" не обязательно —
+            # отвечаем на любой текст. Если человек всё же написал с
+            # обращением, вопросом считаем то, что идёт после него.
             question = match.group(2).strip() if match else message.text.strip()
         else:
+            # В группах/супергруппах реагируем только на явное обращение.
             if not match:
                 return
             question = match.group(2).strip()
@@ -336,6 +305,10 @@ async def main() -> None:
             log.exception("Failed to get answer from AI")
             answer = "Что-то пошло не так при обращении к ИИ. Попробуй ещё раз."
 
+        # Ответ Ириски может содержать "битую" markdown-разметку (например,
+        # непарные * или _), из-за которой Telegram откажется отправлять
+        # сообщение. Раньше это приводило к полному молчанию бота — теперь
+        # при такой ошибке пробуем отправить тот же текст без разметки.
         try:
             await message.reply(answer)
         except TelegramBadRequest:
@@ -358,7 +331,7 @@ async def main() -> None:
         try:
             await asyncio.wait_for(polling_task, timeout=MAX_RUNTIME_SEC)
         except asyncio.TimeoutError:
-            log.info("Достигнут лимит времени работы (%s сек), завершаюсь.", MAX_RUNTIME_SEC)
+            log.info("Достигнут лимит времени работы (%s сек), завершаюсь для рестарта.", MAX_RUNTIME_SEC)
             await dp.stop_polling()
     else:
         await polling_task
