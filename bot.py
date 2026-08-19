@@ -201,15 +201,18 @@ async def ask_ai(chat_id: int, question: str) -> str:
         if resp.status_code == 200:
             try:
                 data = resp.json()
-                answer = data["choices"][0]["message"]["content"]
+                raw_answer = data["choices"][0]["message"]["content"]
             except (KeyError, IndexError):
                 log.error("Unexpected Groq response: %s", data)
                 history.pop()
                 return "Хм, не получилось разобрать ответ ИИ. Попробуй переформулировать вопрос."
             
-            history.append({"role": "assistant", "content": answer})
+            # Очищаем ответ от тегов <think> и их содержимого
+            clean_answer = re.sub(r'<think>.*?</think>', '', raw_answer, flags=re.DOTALL).strip()
+            
+            history.append({"role": "assistant", "content": clean_answer})
             history[:] = history[-MAX_HISTORY_MESSAGES:]
-            return answer.strip()
+            return clean_answer
 
         # Обработка ошибок API
         status_code = resp.status_code
