@@ -5,7 +5,7 @@
 Нужные переменные окружения:
     BOT_TOKEN       — токен телеграм-бота (от @BotFather)
     GROQ_API_KEY    — бесплатный ключ Groq (console.groq.com/keys)
-    GROQ_MODEL      — необязательно, по умолчанию meta-llama/llama-4-scout-17b-16e-instruct
+    GROQ_MODEL      — необязательно, по умолчанию groq/compound-mini
     MAX_RUNTIME_SEC — необязательно, через сколько секунд бот сам
                       завершится (нужно для GitHub Actions, см. bot.yml)
 """
@@ -30,7 +30,7 @@ log = logging.getLogger("iriska")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "groq/compound-mini")
 MAX_RUNTIME_SEC = int(os.environ.get("MAX_RUNTIME_SEC", "0"))  # 0 = без лимита
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -88,6 +88,11 @@ async def ask_ai(chat_id: int, question: str) -> str:
         "temperature": 0.4,
         "max_tokens": 700,
     }
+    if GROQ_MODEL.startswith("groq/compound"):
+        # Все ответы должны идти строго из базы знаний в системном промпте —
+        # отключаем встроенные инструменты (веб-поиск, код), чтобы Ириска не
+        # уходила гуглить и не тратила лишние токены/время на каждый вопрос.
+        payload["compound_custom"] = {"tools": {"enabled_tools": []}}
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
 
     resp = None
