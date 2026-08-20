@@ -181,6 +181,26 @@ TRIGGER_RE = re.compile(r"^\s*[!./]?\s*ирис(ка)?\b[,:]?\s*(.*)$", re.IGNOR
 RETRYABLE_5XX = {500, 502, 503, 504}
 MAX_RETRIES = 2  # повторов на один ключ при 5xx / сетевых ошибках
 
+# Модели, которые умеют "думать" перед ответом и по умолчанию норовят
+# засунуть эти рассуждения прямо в тело ответа, если явно не попросить
+# формат "hidden".
+_REASONING_MODEL_HINTS = ("qwen3", "qwen-qwq", "gpt-oss", "deepseek-r1", "r1-distill")
+
+
+def _is_reasoning_model(model_name: str) -> bool:
+    name = model_name.lower()
+    return any(hint in name for hint in _REASONING_MODEL_HINTS)
+
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+
+
+def _strip_reasoning(text: str) -> str:
+    """Подчищает ответ модели на случай, если рассуждения всё же просочились
+    в content (известный баг reasoning_format=hidden у некоторых моделей
+    Groq — параметр не всегда отрабатывает на 100%)."""
+    return _THINK_BLOCK_RE.sub("", text).strip()
+
 
 async def ask_ai(chat_id: int, question: str) -> str:
     history = HISTORY.setdefault(chat_id, [])
@@ -209,6 +229,12 @@ async def ask_ai(chat_id: int, question: str) -> str:
         # отключаем встроенные инструменты (веб-поиск, код), чтобы Ириска не
         # уходила гуглить и не тратила лишние токены/время на каждый вопрос.
         payload["compound_custom"] = {"tools": {"enabled_tools": []}}
+    if _is_reasoning_model(GROQ_MODEL):
+        # Некоторые модели (Qwen3, GPT-OSS, DeepSeek-R1 и т.п.) по умолчанию
+        # пишут в content ещё и цепочку своих рассуждений ("<think>...</think>",
+        # "Thinking Process" и т.д.) — без этого параметра пользователь в
+        # Telegram получал бы этот внутренний монолог вместо чистого ответа.
+        payload["reasoning_format"] = "hidden"
 
     total_keys = len(GROQ_API_KEYS)
     keys_tried = 0
@@ -256,9 +282,10 @@ async def ask_ai(chat_id: int, question: str) -> str:
                         history.pop()
                         return "Хм, не получилось разобрать ответ ИИ. Попробуй переформулировать вопрос."
 
-                    history.append({"role": "assistant", "content": answer})
+                    clean_answer = _strip_reasoning(answer)
+                    history.append({"role": "assistant", "content": clean_answer})
                     history[:] = history[-MAX_HISTORY_MESSAGES:]
-                    return answer.strip()
+                    return clean_answer
 
                 # Не 200 — логируем и разбираемся, что делать дальше.
                 body_preview = resp.text[:500]
