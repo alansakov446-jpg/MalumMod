@@ -4,21 +4,25 @@
 Запуск: python bot.py
 Нужные переменные окружения:
     BOT_TOKEN       — токен телеграм-бота (от @BotFather)
-    GROQ_API_KEY    — один или несколько бесплатных ключей Groq
-                       (console.groq.com/keys), через запятую:
-                       "gsk_1,gsk_2,gsk_3". Бот сам переключается на
-                       следующий ключ, если текущий упёрся в лимит или
-                       оказался невалидным.
-    GROQ_MODEL      — необязательно, по умолчанию qwen/qwen3.6-27b
+    GROQ_API_KEY    — один или несколько ключей Groq, через запятую:
+                       "gsk_1,gsk_2,gsk_3".
+    GROQ_MODELS     — необязательно, каскад model ID через запятую,
+                       от основной модели к более лёгким резервным.
+    GROQ_MODEL      — устаревший одиночный параметр; поддерживается.
     MAX_RUNTIME_SEC — необязательно, через сколько секунд бот сам
                       завершится (нужно для GitHub Actions, см. bot.yml)
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
 import sys
+import threading
+import time
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import httpx
@@ -27,34 +31,134 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
+    Message,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("iriska")
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+if not BOT_TOKEN:
+    raise RuntimeError("Не задан BOT_TOKEN — добавьте токен Telegram-бота в переменные окружения")
 
-# --- Ротация нескольких ключей Groq -----------------------------------------
-# GROQ_API_KEY может содержать сразу несколько ключей через запятую. Это
-# позволяет пережить лимиты бесплатного тарифа: если один ключ упирается в
-# 429 (rate limit) или оказывается невалидным (401/403), бот автоматически
-# переключается на следующий ключ из списка и повторяет запрос.
-_raw_keys = os.environ["GROQ_API_KEY"]
-GROQ_API_KEYS = [k.strip() for k in _raw_keys.split(",") if k.strip()]
+
+def _split_env_list(value: str) -> list[str]:
+    """Читает список из env: разделители — запятая, точка с запятой или новая строка."""
+    return [item.strip() for item in re.split(r"[,;\n]+", value) if item.strip()]
+
+
+# --- Ключи и каскад моделей Groq --------------------------------------------
+# GROQ_API_KEY принимает несколько ключей через запятую. При превышении
+# лимита на конкретной модели бот пробует более лёгкую модель на том же ключе,
+# а после исчерпания каскада — следующий ключ.
+GROQ_API_KEYS = _split_env_list(os.environ.get("GROQ_API_KEY", ""))
 if not GROQ_API_KEYS:
     raise RuntimeError("GROQ_API_KEY пуст или не содержит ни одного валидного ключа")
 
+_DEFAULT_GROQ_MODELS = ["qwen/qwen3.8-27b", "openai/gpt-oss-20b"]
+_raw_models = os.environ.get("GROQ_MODELS", "").strip()
+if _raw_models:
+    GROQ_MODELS = list(dict.fromkeys(_split_env_list(_raw_models)))
+else:
+    # GROQ_MODEL оставлен для совместимости со старой конфигурацией. Для него
+    # автоматически добавляем резервную модель, чтобы одиночная переменная
+    # тоже получила базовый каскад.
+    _legacy_model = os.environ.get("GROQ_MODEL", "").strip()
+    GROQ_MODELS = list(dict.fromkeys(
+        ([_legacy_model] if _legacy_model else [])
+        + [model for model in _DEFAULT_GROQ_MODELS if model != _legacy_model]
+    ))
+if not GROQ_MODELS:
+    raise RuntimeError("GROQ_MODELS пуст: укажите хотя бы одну активную модель Groq")
+
+# Для старого кода/логов оставляем синоним с основной моделью.
+GROQ_MODEL = GROQ_MODELS[0]
+
+
+def _integer_env(name: str, default: int, minimum: int) -> int:
+    raw_value = os.environ.get(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        return max(minimum, int(raw_value))
+    except ValueError as exc:
+        raise RuntimeError(f"{name} должен быть целым числом") from exc
+
+
+# 429 кешируется отдельно для пары «ключ + модель», чтобы при следующих
+# запросах не стучать в уже исчерпанный лимит и не терять время.
+RATE_LIMIT_COOLDOWN_SEC = _integer_env("GROQ_RATE_LIMIT_COOLDOWN_SEC", 60, 1)
+GROQ_REQUEST_TIMEOUT_SEC = _integer_env("GROQ_REQUEST_TIMEOUT_SEC", 30, 1)
+AI_TOTAL_TIMEOUT_SEC = _integer_env("AI_TOTAL_TIMEOUT_SEC", 60, 5)
+INLINE_AI_TIMEOUT_SEC = _integer_env("INLINE_AI_TIMEOUT_SEC", 22, 5)
+MAX_RUNTIME_SEC = _integer_env("MAX_RUNTIME_SEC", 0, 0)  # 0 = без лимита
+
+_CURRENT_KEY_LOCK = threading.Lock()
+_STATE_LOCK = threading.Lock()
 CURRENT_KEY_INDEX = 0
+_RATE_LIMIT_UNTIL: dict[tuple[int, str], float] = {}
+_UNAVAILABLE_MODELS: set[tuple[int, str]] = set()
+_INVALID_KEYS: set[int] = set()
 
 
 def rotate_key() -> None:
-    """Переключает глобальный указатель на следующий ключ Groq по кругу."""
+    """Переключает текущий ключ на следующий по кругу."""
     global CURRENT_KEY_INDEX
-    CURRENT_KEY_INDEX = (CURRENT_KEY_INDEX + 1) % len(GROQ_API_KEYS)
+    with _CURRENT_KEY_LOCK:
+        CURRENT_KEY_INDEX = (CURRENT_KEY_INDEX + 1) % len(GROQ_API_KEYS)
 
 
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.6-27b")
-MAX_RUNTIME_SEC = int(os.environ.get("MAX_RUNTIME_SEC", "0"))  # 0 = без лимита
+def _get_current_key_index() -> int:
+    with _CURRENT_KEY_LOCK:
+        return CURRENT_KEY_INDEX % len(GROQ_API_KEYS)
+
+
+def _set_current_key_index(index: int) -> None:
+    global CURRENT_KEY_INDEX
+    with _CURRENT_KEY_LOCK:
+        CURRENT_KEY_INDEX = index % len(GROQ_API_KEYS)
+
+
+def _key_is_invalid(key_index: int) -> bool:
+    with _STATE_LOCK:
+        return key_index in _INVALID_KEYS
+
+
+def _disable_key(key_index: int) -> None:
+    with _STATE_LOCK:
+        _INVALID_KEYS.add(key_index)
+
+
+def _model_is_unavailable(key_index: int, model: str) -> bool:
+    with _STATE_LOCK:
+        return (key_index, model) in _UNAVAILABLE_MODELS
+
+
+def _disable_model_for_key(key_index: int, model: str) -> None:
+    with _STATE_LOCK:
+        _UNAVAILABLE_MODELS.add((key_index, model))
+
+
+def _model_cooldown_remaining(key_index: int, model: str) -> float:
+    now = time.monotonic()
+    with _STATE_LOCK:
+        until = _RATE_LIMIT_UNTIL.get((key_index, model), 0.0)
+        if until <= now:
+            _RATE_LIMIT_UNTIL.pop((key_index, model), None)
+            return 0.0
+        return until - now
+
+
+def _mark_model_rate_limited(key_index: int, model: str, cooldown_sec: float) -> None:
+    with _STATE_LOCK:
+        _RATE_LIMIT_UNTIL[(key_index, model)] = time.monotonic() + max(1.0, cooldown_sec)
+
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -122,7 +226,7 @@ Iris | Чат-менеджер (@iris_cm_bot). Ты не сам Iris и не в�
 
 _STOPWORDS = {
     "как", "что", "это", "для", "или", "она", "они", "нее", "него", "мне",
-    "мой", "моя", "мои", "его", "мне", "нам", "вас", "тебя", "если", "чтобы",
+    "мой", "моя", "мои", "его", "нам", "вас", "тебя", "если", "чтобы",
     "можно", "нужно", "пожалуйста", "привет", "ириска", "ирис", "бот",
     "команда", "команду", "команды", "напиши", "подскажи", "помоги",
     "написать", "который", "которая", "которое",
@@ -198,7 +302,7 @@ def build_knowledge_excerpt(question: str) -> str:
 # (простое хранение в памяти процесса; сбрасывается при перезапуске бота).
 # Ключи в GROQ_API_KEYS могут переключаться посреди разговора — история
 # от chat_id никак с этим не связана и никогда не теряется при ротации.
-HISTORY: dict[int, list[dict]] = {}
+HISTORY: dict[object, list[dict]] = {}
 MAX_HISTORY_MESSAGES = 6  # 3 сообщения пользователя + 3 ответа бота
 
 TRIGGER_RE = re.compile(r"^\s*[!./]?\s*ирис(ка)?\b[,:]?\s*(.*)$", re.IGNORECASE | re.DOTALL)
@@ -226,7 +330,7 @@ def _reasoning_effort_for(model_name: str) -> str | None:
     сообщение). Поэтому по возможности отключаем/урезаем reasoning явно."""
     name = model_name.lower()
     if "qwen3" in name or "qwen-qwq" in name:
-        # У моделей семейства Qwen3 (в т.ч. qwen3.6) reasoning_effort
+        # У моделей семейства Qwen3 (в т.ч. qwen3.8) reasoning_effort
         # принимает только "none" (выключить) или "default" (думать).
         return "none"
     if "gpt-oss" in name:
@@ -271,181 +375,506 @@ def _markdown_is_balanced(text: str) -> bool:
     return all(text.count(ch) % 2 == 0 for ch in ("*", "_", "`"))
 
 
-async def ask_ai(chat_id: int, question: str) -> str:
-    history = HISTORY.setdefault(chat_id, [])
-    history.append({"role": "user", "content": question})
+def _build_payload(model: str, messages: list[dict]) -> dict:
+    """Готовит Groq payload с параметрами, подходящими конкретной модели."""
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.4,
+        # max_tokens устарел у Groq; max_completion_tokens работает и для
+        # Qwen, и для актуальных моделей GPT-OSS.
+        "max_completion_tokens": 1024,
+    }
+    if model.startswith("groq/compound"):
+        # Не используем веб-поиск/код: ответы должны опираться на локальную БЗ.
+        payload["compound_custom"] = {"tools": {"enabled_tools": []}}
+    if _is_reasoning_model(model):
+        payload["reasoning_format"] = "hidden"
+        effort = _reasoning_effort_for(model)
+        if effort:
+            payload["reasoning_effort"] = effort
+    return payload
+
+
+def _duration_to_seconds(value: str) -> float | None:
+    """Разбирает Retry-After и Groq reset-значения вроде `2m59.5s`."""
+    text = value.strip().lower()
+    if not text:
+        return None
+
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return float(text)
+
+    clock_match = re.fullmatch(r"(?:(\d+):)?(\d{1,2}):(\d{2})(?:\.(\d+))?", text)
+    if clock_match:
+        hours = int(clock_match.group(1) or 0)
+        minutes = int(clock_match.group(2))
+        seconds = float(clock_match.group(3) + ("." + clock_match.group(4) if clock_match.group(4) else ""))
+        return hours * 3600 + minutes * 60 + seconds
+
+    unit_seconds = {
+        "ms": 0.001, "msec": 0.001, "msecs": 0.001,
+        "millisecond": 0.001, "milliseconds": 0.001,
+        "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+        "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+        "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+        "d": 86400, "day": 86400, "days": 86400,
+    }
+    matches = re.findall(
+        r"(\d+(?:\.\d+)?)\s*(milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)",
+        text,
+    )
+    if matches:
+        total = 0.0
+        for amount, unit in matches:
+            total += float(amount) * unit_seconds[unit]
+        return total
+
+    # Retry-After иногда приходит как HTTP-date вместо числа секунд.
+    try:
+        retry_at = parsedate_to_datetime(value)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        return max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _retry_after_for(resp: httpx.Response) -> float:
+    headers = resp.headers
+    value = headers.get("retry-after")
+    if value:
+        parsed = _duration_to_seconds(value)
+        if parsed is not None and parsed > 0:
+            return min(parsed, 7 * 24 * 60 * 60)
+
+    # В сообщении Groq обычно указан именно тот лимит, который сработал
+    # («try again in 1m...»); используем его до общих reset-заголовков.
+    body = getattr(resp, "text", "") or ""
+    match = re.search(
+        r"(?:try again|retry|reset)[^.!]{0,80}?((?:\d+(?:\.\d+)?\s*(?:milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d)\s*)+)",
+        body,
+        re.IGNORECASE,
+    )
+    if match:
+        parsed = _duration_to_seconds(match.group(1))
+        if parsed is not None and parsed > 0:
+            return min(parsed, 7 * 24 * 60 * 60)
+
+    # Если API не приложил точное время, берём ближайшее известное окно.
+    reset_values = []
+    for header_name in ("x-ratelimit-reset-tokens", "x-ratelimit-reset-requests"):
+        value = headers.get(header_name)
+        parsed = _duration_to_seconds(value) if value else None
+        if parsed is not None and parsed > 0:
+            reset_values.append(parsed)
+    if reset_values:
+        return min(min(reset_values), 7 * 24 * 60 * 60)
+    return float(RATE_LIMIT_COOLDOWN_SEC)
+
+
+def _groq_error(resp: httpx.Response) -> tuple[str, str]:
+    """Возвращает код и безопасный для логов фрагмент ошибки API."""
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        data = {}
+    error = data.get("error", {}) if isinstance(data, dict) else {}
+    if not isinstance(error, dict):
+        error = {}
+    code = str(error.get("code") or "")
+    message = str(error.get("message") or getattr(resp, "text", "") or "без описания")
+    return code, message[:500]
+
+
+def _is_model_unavailable_error(status_code: int, code: str, message: str) -> bool:
+    text = f"{code} {message}".lower()
+    if status_code == 404:
+        return True
+    if status_code == 403:
+        return "model" in text and any(marker in text for marker in (
+            "not authorized", "not authorised", "not allowed", "access denied",
+            "permission", "does not have access",
+        ))
+    if status_code not in (400, 422):
+        return False
+    return any(marker in text for marker in (
+        "model_not_found", "model_decommissioned", "unknown model", "model not found",
+        "model does not exist", "no such model", "model unavailable", "model is not available",
+        "invalid model name",
+    ))
+
+
+def _remove_pending_history(history: list[dict], pending: dict) -> None:
+    for index in range(len(history) - 1, -1, -1):
+        if history[index] is pending:
+            del history[index]
+            return
+
+
+def _format_wait(seconds: float) -> str:
+    seconds = max(1, int(seconds + 0.999))
+    if seconds >= 3600:
+        return f"примерно {max(1, (seconds + 3599) // 3600)} ч"
+    if seconds >= 60:
+        return f"примерно {max(1, (seconds + 59) // 60)} мин"
+    return f"примерно {seconds} сек"
+
+
+async def ask_ai(
+    history_key: object,
+    question: str,
+    *,
+    request_timeout: float | None = None,
+) -> str:
+    """Отвечает через каскад моделей (сильная → резервные) и ключей Groq.
+
+    Превышение лимита запоминается отдельно для пары ключ/модель. Пока лимит
+    не сбросился, следующие запросы сразу переходят на следующую ступень —
+    не тратят время на повторный заведомо ограниченный запрос.
+    """
+    history = HISTORY.setdefault(history_key, [])
+    pending_user_message = {"role": "user", "content": question}
+    history.append(pending_user_message)
     history[:] = history[-MAX_HISTORY_MESSAGES:]
 
-    # Под каждый вопрос собираем компактную выжимку базы знаний (см.
-    # build_knowledge_excerpt) вместо того, чтобы слать её целиком — так
-    # запрос остаётся маленьким независимо от того, насколько выросла
-    # knowledge_base.md.
     excerpt = build_knowledge_excerpt(question)
     system_prompt = (
         f"{BASE_SYSTEM_PROMPT}\nРелевантные разделы базы знаний по командам "
         f"Iris:\n---\n{excerpt}\n---\n"
     )
-
     messages = [{"role": "system", "content": system_prompt}, *history]
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": messages,
-        "temperature": 0.4,
-        "max_tokens": 1024,
-    }
-    if GROQ_MODEL.startswith("groq/compound"):
-        # Все ответы должны идти строго из базы знаний в системном промпте —
-        # отключаем встроенные инструменты (веб-поиск, код), чтобы Ириска не
-        # уходила гуглить и не тратила лишние токены/время на каждый вопрос.
-        payload["compound_custom"] = {"tools": {"enabled_tools": []}}
-    if _is_reasoning_model(GROQ_MODEL):
-        # Некоторые модели (Qwen3, GPT-OSS, DeepSeek-R1 и т.п.) по умолчанию
-        # пишут в content ещё и цепочку своих рассуждений ("<think>...</think>",
-        # "Thinking Process" и т.д.) — без этого параметра пользователь в
-        # Telegram получал бы этот внутренний монолог вместо чистого ответа.
-        payload["reasoning_format"] = "hidden"
-        effort = _reasoning_effort_for(GROQ_MODEL)
-        if effort:
-            # Дополнительно снижаем/выключаем сами рассуждения: иначе модель
-            # может потратить весь max_tokens на скрытые "мысли" и не
-            # оставить места на сам ответ (пустое сообщение в Telegram).
-            payload["reasoning_effort"] = effort
 
     total_keys = len(GROQ_API_KEYS)
-    keys_tried = 0
-
-    # Диагностика: какие типы проблем встретились по ходу перебора ключей —
-    # нужна, чтобы в конце дать пользователю точную и полезную причину.
-    seen_statuses: list[int] = []
+    start_key_index = _get_current_key_index()
     saw_429 = False
-    saw_401_403 = False
     saw_5xx = False
     saw_network_error = False
     saw_empty_response = False
+    saw_model_error = False
+    saw_bad_response = False
     last_status: int | None = None
-    last_error_text: str = ""
+    last_error_text = ""
+    cooldown_waits: list[float] = []
+    successful = False
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        while keys_tried < total_keys:
-            key = GROQ_API_KEYS[CURRENT_KEY_INDEX]
-            key_num = CURRENT_KEY_INDEX + 1
-            headers = {"Authorization": f"Bearer {key}"}
+    try:
+        async with httpx.AsyncClient(timeout=request_timeout or GROQ_REQUEST_TIMEOUT_SEC) as client:
+            for key_offset in range(total_keys):
+                key_index = (start_key_index + key_offset) % total_keys
+                key_num = key_index + 1
+                if _key_is_invalid(key_index):
+                    continue
 
-            for attempt in range(MAX_RETRIES + 1):
-                try:
-                    resp = await client.post(GROQ_URL, headers=headers, json=payload)
-                except (httpx.TimeoutException, httpx.RequestError) as exc:
-                    log.error(
-                        "Сетевая ошибка при обращении к Groq (ключ #%s/%s, попытка %s): %s",
-                        key_num, total_keys, attempt + 1, exc,
-                    )
-                    saw_network_error = True
-                    last_error_text = str(exc)
-                    if attempt < MAX_RETRIES:
-                        await asyncio.sleep(2 * (attempt + 1))
+                key_was_rejected = False
+                for model in GROQ_MODELS:
+                    if key_was_rejected:
+                        break
+                    if _model_is_unavailable(key_index, model):
+                        saw_model_error = True
                         continue
-                    # исчерпали попытки на этом ключе из-за сети — переходим
-                    # к следующему ключу (вдруг дело было не в сети, а в проблеме
-                    # именно с этим соединением/ключом)
-                    break
 
-                if resp.status_code == 200:
-                    data = resp.json()
-                    try:
-                        answer = data["choices"][0]["message"]["content"]
-                    except (KeyError, IndexError):
-                        log.error("Unexpected Groq response: %s", data)
-                        history.pop()
-                        return "Хм, не получилось разобрать ответ ИИ. Попробуй переформулировать вопрос."
-
-                    clean_answer = _sanitize_markdown(_strip_reasoning(answer))
-                    if not clean_answer:
-                        # Модель вернула 200, но пустой (после очистки от
-                        # рассуждений) ответ — обычно значит, что весь
-                        # max_tokens ушёл на скрытые размышления и на сам
-                        # текст не осталось места. Отправлять пустое
-                        # сообщение нельзя (Telegram ответит ошибкой), так
-                        # что считаем это неудачной попыткой и пробуем ещё раз.
-                        saw_empty_response = True
-                        log.warning(
-                            "Groq вернул пустой ответ после очистки от рассуждений "
-                            "(ключ #%s/%s, попытка %s), finish_reason=%s",
-                            key_num, total_keys, attempt + 1,
-                            data.get("choices", [{}])[0].get("finish_reason"),
+                    remaining = _model_cooldown_remaining(key_index, model)
+                    if remaining > 0:
+                        saw_429 = True
+                        cooldown_waits.append(remaining)
+                        log.debug(
+                            "Пропускаю модель %s на ключе #%s: лимит сбросится через %s",
+                            model, key_num, _format_wait(remaining),
                         )
-                        if attempt < MAX_RETRIES:
-                            continue
+                        continue
+
+                    payload = _build_payload(model, messages)
+                    headers = {"Authorization": f"Bearer {GROQ_API_KEYS[key_index]}"}
+                    for attempt in range(MAX_RETRIES + 1):
+                        try:
+                            resp = await client.post(GROQ_URL, headers=headers, json=payload)
+                        except (httpx.TimeoutException, httpx.RequestError) as exc:
+                            log.warning(
+                                "Сетевая ошибка Groq (ключ #%s/%s, модель %s, попытка %s): %s",
+                                key_num, total_keys, model, attempt + 1, exc,
+                            )
+                            saw_network_error = True
+                            last_error_text = str(exc)[:300]
+                            if attempt < MAX_RETRIES:
+                                await asyncio.sleep(2 * (attempt + 1))
+                                continue
+                            break
+
+                        if resp.status_code == 200:
+                            try:
+                                data = resp.json()
+                            except (ValueError, TypeError):
+                                log.error("Groq вернул некорректный JSON (ключ #%s, модель %s)", key_num, model)
+                                saw_bad_response = True
+                                break
+
+                            try:
+                                choices = data["choices"]
+                                raw_answer = choices[0]["message"]["content"]
+                            except (KeyError, IndexError, TypeError):
+                                log.error("Неожиданный формат ответа Groq (ключ #%s, модель %s)", key_num, model)
+                                saw_bad_response = True
+                                break
+
+                            clean_answer = _sanitize_markdown(_strip_reasoning(str(raw_answer or "")))
+                            if not clean_answer:
+                                saw_empty_response = True
+                                log.warning(
+                                    "Пустой ответ Groq (ключ #%s, модель %s, попытка %s), finish_reason=%s",
+                                    key_num, model, attempt + 1,
+                                    choices[0].get("finish_reason") if isinstance(choices[0], dict) else None,
+                                )
+                                if attempt < MAX_RETRIES:
+                                    continue
+                                break
+
+                            _set_current_key_index(key_index)
+                            history.append({"role": "assistant", "content": clean_answer})
+                            history[:] = history[-MAX_HISTORY_MESSAGES:]
+                            successful = True
+                            log.info("Ответ Groq: ключ #%s/%s, модель %s", key_num, total_keys, model)
+                            return clean_answer
+
+                        status_code = resp.status_code
+                        code, error_text = _groq_error(resp)
+                        last_status = status_code
+                        last_error_text = error_text
+                        log.warning(
+                            "Groq error %s (ключ #%s/%s, модель %s, попытка %s): %s",
+                            status_code, key_num, total_keys, model, attempt + 1, error_text[:300],
+                        )
+
+                        if status_code == 429:
+                            saw_429 = True
+                            cooldown = _retry_after_for(resp)
+                            cooldown_waits.append(cooldown)
+                            _mark_model_rate_limited(key_index, model, cooldown)
+                            log.info(
+                                "Лимит модели %s на ключе #%s; переключаюсь на следующую ступень каскада",
+                                model, key_num,
+                            )
+                            break
+
+                        if status_code in (401, 403):
+                            if status_code == 403 and _is_model_unavailable_error(status_code, code, error_text):
+                                saw_model_error = True
+                                _disable_model_for_key(key_index, model)
+                                log.warning(
+                                    "Модель %s недоступна для ключа #%s; пробую резервную модель",
+                                    model, key_num,
+                                )
+                                break
+                            _disable_key(key_index)
+                            key_was_rejected = True
+                            break
+
+                        if status_code in RETRYABLE_5XX:
+                            saw_5xx = True
+                            if attempt < MAX_RETRIES:
+                                await asyncio.sleep(2 * (attempt + 1))
+                                continue
+                            break
+
+                        if status_code in (400, 404, 422):
+                            saw_model_error = True
+                            if _is_model_unavailable_error(status_code, code, error_text):
+                                _disable_model_for_key(key_index, model)
+                                log.warning(
+                                    "Модель %s недоступна для ключа #%s; отключаю её до перезапуска",
+                                    model, key_num,
+                                )
+                            # Ошибка конкретной модели/параметров не должна
+                            # блокировать резервную модель и остальные ключи.
+                            break
+
+                        # Остальные ошибки тоже не повторяем с тем же payload;
+                        # пробуем следующую модель и, если нужно, другой ключ.
                         break
 
-                    history.append({"role": "assistant", "content": clean_answer})
-                    history[:] = history[-MAX_HISTORY_MESSAGES:]
-                    return clean_answer
+        # Ни один вариант из каскада не сработал — объясняем причину, не
+        # сохраняя безответный вопрос в контексте диалога.
+        if all(_key_is_invalid(index) for index in range(total_keys)):
+            return "Ошибка авторизации: все указанные API-ключи Groq недействительны или заблокированы."
 
-                # Не 200 — логируем и разбираемся, что делать дальше.
-                body_preview = resp.text[:500]
-                log.error(
-                    "Groq error %s (ключ #%s/%s, попытка %s): %s",
-                    resp.status_code, key_num, total_keys, attempt + 1, body_preview,
-                )
-                seen_statuses.append(resp.status_code)
-                last_status = resp.status_code
-                last_error_text = resp.text[:300]
+        if saw_429:
+            wait_text = _format_wait(min(cooldown_waits)) if cooldown_waits else "немного"
+            return (
+                "Сейчас лимит запросов или токенов Groq исчерпан на доступных "
+                f"моделях и ключах. Попробуй ещё раз через {wait_text}."
+            )
+        if saw_network_error:
+            return "Сетевая ошибка или таймаут при подключении к Groq. Попробуй ещё раз чуть позже."
+        if saw_5xx:
+            return "Сервер Groq временно недоступен или перегружен. Попробуй позже."
+        if saw_empty_response:
+            return "Модель вернула пустой ответ. Попробуй задать вопрос короче и конкретнее."
+        if saw_model_error:
+            detail = f" Последняя ошибка API: {last_error_text}" if last_error_text else ""
+            return (
+                "Не удалось использовать настроенные модели Groq. Проверь GROQ_MODELS "
+                "и активные model ID в Groq Console." + detail
+            )
+        if saw_bad_response:
+            return "Groq вернул ответ в неожиданном формате. Попробуй ещё раз позже."
+        if last_status is not None:
+            return f"Ошибка API Groq [{last_status}]: {last_error_text or 'без описания'}"
+        return "Не смогла обратиться к ИИ. Попробуй ещё раз чуть позже 🙏"
+    finally:
+        if not successful:
+            _remove_pending_history(history, pending_user_message)
 
-                if resp.status_code == 429:
-                    saw_429 = True
-                    # На лимите нет смысла долбить тот же ключ повторно —
-                    # сразу переключаемся на следующий.
-                    break
 
-                if resp.status_code in (401, 403):
-                    saw_401_403 = True
-                    # Ключ невалиден/заблокирован — повторять запрос с ним
-                    # бессмысленно, сразу пробуем следующий ключ.
-                    break
+_INLINE_CACHE_TTL_SEC = 90
+_INLINE_CACHE_MAX_ITEMS = 256
+_INLINE_ANSWER_CACHE: dict[tuple[int, str], tuple[float, str]] = {}
+_CODE_BLOCK_RE = re.compile(r"```(.*?)```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_CODE_LANGUAGE_TAGS = {
+    "text", "plain", "txt", "python", "py", "bash", "sh", "json",
+    "javascript", "js", "html", "yaml", "yml",
+}
 
-                if resp.status_code in RETRYABLE_5XX:
-                    saw_5xx = True
-                    if attempt < MAX_RETRIES:
-                        await asyncio.sleep(2 * (attempt + 1))
-                        continue
-                    break
 
-                # Любая другая ошибка — тоже не повторяем на этом ключе.
-                break
+def _inline_question(query: str) -> str:
+    """Принимает как «ириска вопрос», так и просто «вопрос» после @бота."""
+    query = query.strip()
+    match = TRIGGER_RE.match(query)
+    return match.group(2).strip() if match else query
 
-            keys_tried += 1
-            if keys_tried < total_keys:
-                rotate_key()
-                log.warning(
-                    "Переключаюсь на следующий ключ Groq (#%s из %s)",
-                    CURRENT_KEY_INDEX + 1, total_keys,
-                )
 
-    # Прошли по всем доступным ключам и ни один не сработал.
-    history.pop()  # не сохраняем вопрос, на который не получили ответ
+def extract_suggested_command(answer: str) -> str | None:
+    """Достаёт первую команду из кодового блока/inline-кода для отдельного результата."""
+    for block in _CODE_BLOCK_RE.findall(answer):
+        command = block.strip()
+        if not command:
+            continue
+        lines = command.splitlines()
+        if len(lines) > 1 and lines[0].strip().lower() in _CODE_LANGUAGE_TAGS:
+            command = "\n".join(lines[1:]).strip()
+        if command:
+            return command
+    for inline_code in _INLINE_CODE_RE.findall(answer):
+        command = inline_code.strip()
+        if command:
+            return command
+    return None
 
-    only_429 = bool(seen_statuses) and all(s == 429 for s in seen_statuses) and not saw_network_error
-    only_auth = bool(seen_statuses) and all(s in (401, 403) for s in seen_statuses) and not saw_network_error
 
-    if only_429:
-        return (
-            "Все доступные API-ключи исчерпали лимит токенов (Rate Limit). "
-            "Подождите 2-3 минуты."
+def _truncate_telegram_text(text: str, limit: int = 3900) -> str:
+    if len(text) <= limit:
+        return text
+    suffix = "\n\n… (ответ сокращён)"
+    keep = max(1, limit - len(suffix))
+    return text[:keep].rstrip() + suffix
+
+
+def _inline_preview(text: str, limit: int = 220) -> str:
+    preview = re.sub(r"```", "", text)
+    preview = re.sub(r"[*_`]", "", preview)
+    preview = re.sub(r"\s+", " ", preview).strip()
+    if len(preview) > limit:
+        preview = preview[: limit - 1].rstrip() + "…"
+    return preview
+
+
+def _inline_again_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="💬 Спросить Ириску ещё",
+            switch_inline_query_current_chat="ириска ",
         )
-    if only_auth:
-        return "Ошибка авторизации: указанные API-ключи Groq недействительны или заблокированы."
-    if saw_5xx:
-        return "Сервер ИИ (Groq) временно недоступен или перегружен. Попробуйте позже."
-    if saw_network_error:
-        return "Сетевая ошибка или таймаут при подключении к ИИ. Попробуйте ещё раз через пару секунд."
-    if saw_empty_response:
-        return (
-            "Модель не успела дописать ответ (ушло слишком много токенов на "
-            "размышления). Попробуй задать вопрос короче и конкретнее."
+    ]])
+
+
+def _make_inline_results(question: str, answer: str, *, plain_text: bool = False) -> list[InlineQueryResultArticle]:
+    digest = hashlib.sha1(f"{question}\0{answer}".encode()).hexdigest()[:16]
+    message_text = _truncate_telegram_text(answer)
+    parse_mode = None
+    if not plain_text and _markdown_is_balanced(message_text):
+        parse_mode = ParseMode.MARKDOWN
+
+    results = [InlineQueryResultArticle(
+        id=f"answer-{digest}",
+        title="🍬 Ответ Ириски",
+        description=_inline_preview(answer),
+        input_message_content=InputTextMessageContent(
+            message_text=message_text,
+            parse_mode=parse_mode,
+        ),
+        reply_markup=_inline_again_keyboard(),
+    )]
+
+    command = extract_suggested_command(answer)
+    if command:
+        command_text = _truncate_telegram_text(command, limit=3500)
+        # Не отправляем голую команду: Iris мог бы выполнить её сразу после
+        # вставки в чат. В результате она только показывается для копирования.
+        copy_text = (
+            "Готовая команда для копирования (не отправляй это сообщение как команду):\n\n"
+            f"{command_text}\n\nСкопируй команду и отправь её отдельно."
         )
-    if last_status is not None:
-        return f"Ошибка API Groq [{last_status}]: {last_error_text or 'без описания'}"
-    return "Не смогла обратиться к ИИ. Попробуй ещё раз чуть позже 🙏"
+        results.append(InlineQueryResultArticle(
+            id=f"command-{digest}",
+            title=f"📋 Команда: {_inline_preview(command, 48)}"[:64],
+            description="Нажми, чтобы показать готовую команду отдельно",
+            input_message_content=InputTextMessageContent(
+                message_text=copy_text,
+                parse_mode=None,
+            ),
+            reply_markup=_inline_again_keyboard(),
+        ))
+    return results
+
+
+def _make_inline_hint_result() -> InlineQueryResultArticle:
+    return InlineQueryResultArticle(
+        id="inline-hint",
+        title="Спроси Ириску про команду Iris",
+        description="Например: «ириска как заключить брак?»",
+        input_message_content=InputTextMessageContent(
+            message_text=(
+                "Напиши вопрос после имени бота, например:\n"
+                "@имя_бота ириска как заключить брак?\n\n"
+                "Потом выбери «Ответ Ириски» или отдельный результат с командой."
+            ),
+            parse_mode=None,
+        ),
+    )
+
+
+def _get_inline_cached_answer(user_id: int, question: str) -> str | None:
+    cache_key = (user_id, re.sub(r"\s+", " ", question).strip().casefold())
+    cached = _INLINE_ANSWER_CACHE.get(cache_key)
+    if not cached:
+        return None
+    expires_at, answer = cached
+    if expires_at <= time.monotonic():
+        _INLINE_ANSWER_CACHE.pop(cache_key, None)
+        return None
+    return answer
+
+
+def _cache_inline_answer(user_id: int, question: str, answer: str) -> None:
+    cache_key = (user_id, re.sub(r"\s+", " ", question).strip().casefold())
+    now = time.monotonic()
+    # Подчищаем протухшие записи и ограничиваем кэш по размеру.
+    for key, (expires_at, _) in list(_INLINE_ANSWER_CACHE.items()):
+        if expires_at <= now:
+            _INLINE_ANSWER_CACHE.pop(key, None)
+    if len(_INLINE_ANSWER_CACHE) >= _INLINE_CACHE_MAX_ITEMS:
+        oldest_key = min(_INLINE_ANSWER_CACHE, key=lambda key: _INLINE_ANSWER_CACHE[key][0])
+        _INLINE_ANSWER_CACHE.pop(oldest_key, None)
+    _INLINE_ANSWER_CACHE[cache_key] = (now + _INLINE_CACHE_TTL_SEC, answer)
+
+
+def _is_transient_ai_error(answer: str) -> bool:
+    return answer.startswith((
+        "Сейчас лимит", "Сетевая ошибка", "Сервер Groq", "Ошибка API Groq",
+        "Не удалось использовать настроенные модели", "Не смогла обратиться",
+        "Ошибка авторизации", "Модель вернула", "Groq вернул",
+        "Что-то пошло не так", "Запрос занял слишком много времени",
+    ))
 
 
 async def main() -> None:
@@ -460,10 +889,57 @@ async def main() -> None:
             "В *группе* обращайся ко мне с приставкой: "
             "`!ириска помоги замутить человека на 7 дней`.\n"
             "В *личных сообщениях* приставка не нужна — просто пиши вопрос "
-            "как есть.\n\n"
+            "как есть.\n"
+            "Есть и *инлайн-режим*: набери `@имя_бота ириска как заключить брак?` "
+            "и выбери результат «Ответ Ириски» или отдельную готовую команду.\n\n"
             "Я знаю про модерацию, баны/муты/варны, ранги, чистку чата, "
             "профиль, экономику ирисок, РП и другие модули Iris."
         )
+
+    @dp.inline_query()
+    async def handle_inline_query(inline_query: InlineQuery) -> None:
+        question = _inline_question(inline_query.query)
+        if len(question.strip()) < 3:
+            await inline_query.answer(
+                [_make_inline_hint_result()],
+                cache_time=1,
+                is_personal=True,
+            )
+            return
+
+        user_id = inline_query.from_user.id
+        answer = _get_inline_cached_answer(user_id, question)
+        if answer is None:
+            try:
+                answer = await asyncio.wait_for(
+                    ask_ai(
+                        f"inline:{user_id}",
+                        question,
+                        request_timeout=min(GROQ_REQUEST_TIMEOUT_SEC, INLINE_AI_TIMEOUT_SEC),
+                    ),
+                    timeout=INLINE_AI_TIMEOUT_SEC,
+                )
+            except TimeoutError:
+                answer = "Запрос занял слишком много времени. Попробуй повторить его в личке с ботом."
+            except Exception:
+                log.exception("Failed to answer inline query")
+                answer = "Что-то пошло не так при обращении к ИИ. Попробуй ещё раз."
+
+            if answer and not _is_transient_ai_error(answer):
+                _cache_inline_answer(user_id, question, answer)
+
+        results = _make_inline_results(question, answer)
+        try:
+            # Персональные ответы и нулевой Telegram-кэш: в ответах может быть
+            # контекст переписки конкретного пользователя.
+            await inline_query.answer(results, cache_time=0, is_personal=True)
+        except TelegramBadRequest:
+            log.warning("Inline result rejected by Telegram; retrying without Markdown")
+            await inline_query.answer(
+                _make_inline_results(question, answer, plain_text=True),
+                cache_time=0,
+                is_personal=True,
+            )
 
     @dp.message()
     async def handle_message(message: Message) -> None:
@@ -490,7 +966,12 @@ async def main() -> None:
 
         await message.bot.send_chat_action(message.chat.id, "typing")
         try:
-            answer = await ask_ai(message.chat.id, question)
+            answer = await asyncio.wait_for(
+                ask_ai(message.chat.id, question),
+                timeout=AI_TOTAL_TIMEOUT_SEC,
+            )
+        except TimeoutError:
+            answer = "ИИ отвечает слишком долго. Попробуй повторить вопрос чуть позже."
         except Exception:
             log.exception("Failed to get answer from AI")
             answer = "Что-то пошло не так при обращении к ИИ. Попробуй ещё раз."
@@ -510,6 +991,7 @@ async def main() -> None:
         # если он не сходится, сразу шлём обычным текстом (без parse_mode),
         # не дожидаясь ошибки. Try/except ниже — просто дополнительная
         # подстраховка на случай более хитрой поломки разметки.
+        answer = _truncate_telegram_text(answer, limit=3900)
         use_markdown = _markdown_is_balanced(answer)
         try:
             if use_markdown:
@@ -530,8 +1012,8 @@ async def main() -> None:
             log.exception("Failed to send reply")
 
     log.info(
-        "Ириска запущена, модель: %s, ключей Groq: %s",
-        GROQ_MODEL, len(GROQ_API_KEYS),
+        "Ириска запущена, каскад Groq: %s, ключей: %s",
+        " -> ".join(GROQ_MODELS), len(GROQ_API_KEYS),
     )
 
     polling_task = asyncio.create_task(dp.start_polling(bot))
@@ -539,7 +1021,7 @@ async def main() -> None:
     if MAX_RUNTIME_SEC > 0:
         try:
             await asyncio.wait_for(polling_task, timeout=MAX_RUNTIME_SEC)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.info("Достигнут лимит времени работы (%s сек), завершаюсь для рестарта.", MAX_RUNTIME_SEC)
             await dp.stop_polling()
     else:
